@@ -392,5 +392,17 @@ async def extract_ine_data_base64(request_data: dict):
 if __name__ == "__main__":
     import uvicorn
     import os
+    
+    # Railway proporciona PORT como variable de entorno
     port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    
+    print(f"🚀 Starting INE OCR service on port {port}")
+    print(f"🏥 Health check available at: http://0.0.0.0:{port}/health")
+    
+    uvicorn.run(
+        app, 
+        host="0.0.0.0", 
+        port=port,
+        log_level="info",
+        access_log=True
+    )
