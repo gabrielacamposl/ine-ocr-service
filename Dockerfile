@@ -26,5 +26,5 @@ COPY . .
 # Exponer puerto
 EXPOSE 8000
 
-# Comando para ejecutar la aplicación (Railway maneja PORT automáticamente)
-CMD uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}
+# Usar Python directamente (maneja PORT automáticamente)
+CMD ["python", "main.py"]
