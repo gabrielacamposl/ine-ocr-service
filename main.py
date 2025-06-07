@@ -1,4 +1,3 @@
-# main.py - INE OCR Microservice
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import cv2
@@ -11,15 +10,17 @@ from PIL import Image
 import logging
 from typing import Optional, Dict, Tuple
 import gc
-
+import uvicorn
+import os
+    
 # Configurar logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
-    title="INE OCR Microservice",
-    description="Microservicio para extraer CIC e Identificador del Ciudadano de INE mexicana",
-    version="1.0.0"
+    title="INE OCR Microservice - MEJORADO",
+    description="Microservicio para extraer CIC e Identificador del Ciudadano de INE mexicana con patrones optimizados",
+    version="2.0.0"
 )
 
 # Configurar CORS
@@ -32,27 +33,28 @@ app.add_middleware(
 )
 
 class INEProcessor:
-    """Clase principal para procesar imágenes de INE y extraer datos"""
+    """Clase principal para procesar imágenes de INE y extraer datos - VERSIÓN MEJORADA"""
     
     def __init__(self):
         # Configurar pytesseract
         pytesseract.pytesseract.tesseract_cmd = '/usr/bin/tesseract'  # Para Railway/Docker
         
-        # Patrones regex para extraer datos específicos de INE
         self.patterns = {
             'cic': [
-                r'IDMEX(\d{10})',  # Patrón principal CIC
-                r'(\d{13})',       # CIC como secuencia de 13 dígitos
-                r'CIC[:\s]*(\d+)', # CIC precedido por "CIC"
+                r'IDMEX(\d{9})',                    # Patrón principal: 9 dígitos después de IDMEX
+                r'IDMEX(\d{9})\d*',                 # Alternativo: primeros 9 dígitos después de IDMEX
+                r'CIC[:\s]*(\d{9,10})',             # CIC precedido por "CIC"
             ],
             'id_ciudadano': [
-                r'(\d{13})',       # Identificador como secuencia de 13 dígitos
-                r'(\d{10})',       # Identificador como secuencia de 10 dígitos
-                r'ID[:\s]*(\d+)',  # ID precedido por "ID"
+                r'IDMEX\d+<<\d*(\d{9})(?:\s|$)',    # Últimos 9 dígitos de la línea IDMEX
+                r'IDMEX\d+<<\d*(\d{9})',            # Alternativo sin fin de línea
+                r'<<\d*(\d{9})(?:\s|$)',            # Últimos 9 dígitos después de <<
+                r'(\d{9})(?:\s|$)',                 # Fallback: cualquier secuencia de 9 dígitos al final
             ],
             'curp': [
                 r'([A-Z]{4}\d{6}[HM][A-Z]{5}[A-Z\d]{2})',  # Patrón CURP estándar
                 r'CURP[:\s]*([A-Z]{4}\d{6}[HM][A-Z]{5}[A-Z\d]{2})',
+                r'^[A-Z]{1}[AEIOU]{1}[A-Z]{2}\d{2}(0[1-9]|1[0-2])(0[1-9]|[12][0-9]|3[01])[HM]{1}(AS|BC|BS|CC|CL|CM|CS|CH|DF|DG|GT|GR|HG|JC|MC|MN|MS|NT|NL|OC|PL|QT|QR|SP|SL|SR|TC|TS|TL|VZ|YN|ZS|NE)[B-DF-HJ-NP-TV-Z]{3}[A-Z\d]{1}[A-Z\d]{1}$',
             ]
         }
     
@@ -66,7 +68,7 @@ class INEProcessor:
             logger.error(f"Error en limpieza de memoria: {e}")
     
     def preprocess_image(self, image: np.ndarray) -> np.ndarray:
-        """Preprocesa la imagen para mejorar el OCR"""
+        """Preprocesa la imagen para mejorar el OCR, especialmente números"""
         try:
             # Convertir a escala de grises
             if len(image.shape) == 3:
@@ -82,42 +84,66 @@ class INEProcessor:
                 new_height = int(height * scale)
                 gray = cv2.resize(gray, (new_width, new_height), interpolation=cv2.INTER_AREA)
             
-            # Aplicar filtro bilateral para reducir ruido manteniendo bordes
-            denoised = cv2.bilateralFilter(gray, 9, 75, 75)
+            blurred = cv2.GaussianBlur(gray, (3, 3), 0)
             
-            # Mejorar contraste usando CLAHE
-            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+            # Aplicar filtro bilateral para reducir ruido manteniendo bordes nítidos
+            denoised = cv2.bilateralFilter(blurred, 9, 75, 75)
+            
+            # Mejorar contraste usando CLAHE con parámetros optimizados para texto
+            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
             enhanced = clahe.apply(denoised)
             
-            # Aplicar threshold adaptativo
+            # Aplicar unsharp masking para hacer los números más nítidos
+            gaussian = cv2.GaussianBlur(enhanced, (0, 0), 2.0)
+            unsharp_mask = cv2.addWeighted(enhanced, 1.5, gaussian, -0.5, 0)
+            
+            # Aplicar threshold adaptativo con parámetros optimizados para números
             binary = cv2.adaptiveThreshold(
-                enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
+                unsharp_mask, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 
+                blockSize=15,  # Aumentado para mejor detección de números
+                C=10           # Ajustado para mejor contraste
             )
             
-            # Operaciones morfológicas para limpiar texto
-            kernel = np.ones((1,1), np.uint8)
-            cleaned = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+            kernel_small = np.ones((1,1), np.uint8)
+            cleaned = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel_small)
             
-            return cleaned
+            # Aplicar opening para separar números que puedan estar conectados
+            kernel_open = np.ones((2,2), np.uint8)
+            opened = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, kernel_open)
+            
+            # Dilatar ligeramente para hacer números más gruesos y legibles
+            kernel_dilate = np.ones((1,1), np.uint8)
+            final_image = cv2.dilate(opened, kernel_dilate, iterations=1)
+            
+            return final_image
             
         except Exception as e:
             logger.error(f"Error en preprocesamiento: {e}")
             return image
     
     def extract_text_regions(self, image: np.ndarray) -> list:
-        """Extrae regiones de texto específicas de la INE"""
+        """Extrae regiones de texto específicas de la INE, optimizado para datos traseros"""
         try:
             height, width = image.shape
             
-            # Definir regiones donde típicamente aparecen los datos en INE
+            # 📍 REGIONES ESPECÍFICAS PARA INE (enfocadas en parte trasera)
             regions = [
-                # Región principal donde aparece IDMEX y datos
-                {"name": "main_data", "roi": (0, int(height*0.6), width, int(height*0.9))},
-                # Región inferior donde aparecen códigos
-                {"name": "bottom_codes", "roi": (0, int(height*0.8), width, height)},
-                # Región central
+                # Región específica para línea IDMEX (parte inferior central)
+                {"name": "idmex_region", "roi": (0, int(height*0.7), width, int(height*0.95))},
+                
+                # Región para códigos inferiores (donde aparecen CIC e ID)
+                {"name": "bottom_codes", "roi": (0, int(height*0.6), width, height)},
+                
+                # Región central amplia (para capturar datos principales)
+                {"name": "center_wide", "roi": (0, int(height*0.3), width, int(height*0.8))},
+                
+                # Región superior (para CURP y otros datos)
+                {"name": "top_data", "roi": (0, 0, width, int(height*0.4))},
+                
+                # Región central específica (datos del medio)
                 {"name": "center", "roi": (0, int(height*0.4), width, int(height*0.7))},
-                # Toda la imagen como fallback
+                
+                # Toda la imagen como fallback final
                 {"name": "full", "roi": (0, 0, width, height)}
             ]
             
@@ -125,41 +151,73 @@ class INEProcessor:
             
             for region in regions:
                 x, y, x2, y2 = region["roi"]
+                
+                # Asegurar que las coordenadas estén dentro de los límites
+                x = max(0, x)
+                y = max(0, y)
+                x2 = min(width, x2)
+                y2 = min(height, y2)
+                
+                # Extraer ROI
                 roi = image[y:y2, x:x2]
                 
                 if roi.size > 0:
-                    extracted_regions.append({
-                        "name": region["name"],
-                        "image": roi,
-                        "coordinates": region["roi"]
-                    })
+                    # Verificar que la región tenga contenido útil
+                    if roi.shape[0] > 10 and roi.shape[1] > 10:  # Mínimo 10x10 pixels
+                        extracted_regions.append({
+                            "name": region["name"],
+                            "image": roi,
+                            "coordinates": (x, y, x2, y2)
+                        })
+                        logger.debug(f"Región extraída: {region['name']} - {roi.shape}")
             
             return extracted_regions
             
         except Exception as e:
             logger.error(f"Error extrayendo regiones: {e}")
+            # Fallback seguro
             return [{"name": "full", "image": image, "coordinates": (0, 0, width, height)}]
     
     def perform_ocr(self, image: np.ndarray) -> str:
-        """Realiza OCR en la imagen usando diferentes configuraciones"""
+        """Realiza OCR en la imagen usando configuraciones optimizadas para números"""
         try:
-            # Configuraciones de OCR para diferentes casos
+            # 🔍 CONFIGURACIONES DE OCR OPTIMIZADAS PARA NÚMEROS EN INE
             configs = [
-                '--psm 6 -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ',  # Solo números y letras
-                '--psm 7 -c tessedit_char_whitelist=0123456789',  # Solo números
-                '--psm 8 -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ',  # Una palabra
-                '--psm 6',  # Bloque de texto uniforme
-                '--psm 4',  # Columna de texto
+                # Configuración específica para números con caracteres permitidos
+                '--psm 6 -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ<>',
+                
+                # Configuración para líneas de texto con números
+                '--psm 7 -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ<>',
+                
+                # Configuración para palabras individuales (útil para IDMEX)
+                '--psm 8 -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ<>',
+                
+                # Configuración específica solo para números (para códigos)
+                '--psm 6 -c tessedit_char_whitelist=0123456789<>',
+                '--psm 7 -c tessedit_char_whitelist=0123456789<>',
+                
+                # Configuraciones con diferentes PSM para mejor reconocimiento
+                '--psm 6 -c tessedit_char_blacklist=!@#$%^&*()_+=[]{}|;:,.<>?`~',
+                '--psm 13 -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ<>',
+                
+                # Configuración general como fallback
+                '--psm 6',
+                '--psm 4',
             ]
             
             results = []
             
             for config in configs:
                 try:
-                    text = pytesseract.image_to_string(image, config=config, lang='spa')
+                    # Usar idioma español para mejor reconocimiento
+                    text = pytesseract.image_to_string(image, config=config, lang='spa+eng')
                     if text.strip():
-                        results.append(text.strip())
-                except:
+                        # Limpiar el texto extraído
+                        cleaned_text = self.clean_ocr_text(text.strip())
+                        if cleaned_text:
+                            results.append(cleaned_text)
+                except Exception as e:
+                    logger.debug(f"Error en configuración OCR: {e}")
                     continue
             
             # Combinar todos los resultados
@@ -170,54 +228,142 @@ class INEProcessor:
             logger.error(f"Error en OCR: {e}")
             return ""
     
+    def clean_ocr_text(self, text: str) -> str:
+        """Limpia el texto OCR y corrige errores comunes de números"""
+        try:
+            # 🧹 CORRECCIONES ESPECÍFICAS PARA NÚMEROS CONFUNDIDOS
+            replacements = {
+                # Correcciones específicas para números confundidos
+                'l': '1',     # l minúscula -> 1
+                'I': '1',     # I mayúscula -> 1
+                'O': '0',     # O mayúscula -> 0
+                'o': '0',     # o minúscula -> 0
+                'S': '5',     # S -> 5 (en algunos casos)
+                'Z': '2',     # Z -> 2 (en algunos casos)
+                'B': '8',     # B -> 8 (en algunos casos)
+                'G': '6',     # G -> 6 (en algunos casos)
+                
+                # Limpiar caracteres extraños
+                ' ': '',      # Eliminar espacios
+                '\n': ' ',    # Convertir saltos de línea a espacios
+                '\t': ' ',    # Convertir tabs a espacios
+            }
+            
+            cleaned = text
+            for old, new in replacements.items():
+                cleaned = cleaned.replace(old, new)
+            
+            # Limpiar espacios múltiples
+            cleaned = re.sub(r'\s+', ' ', cleaned)
+            
+            return cleaned.strip()
+            
+        except Exception as e:
+            logger.error(f"Error limpiando texto OCR: {e}")
+            return text
+    
     def extract_data_with_patterns(self, text: str) -> Dict[str, Optional[str]]:
-        """Extrae CIC, ID Ciudadano y CURP usando patrones regex"""
+        """Extrae CIC, ID Ciudadano y CURP usando patrones regex optimizados"""
         extracted_data = {
             'cic': None,
             'id_ciudadano': None,
             'curp': None
         }
         
-        # Limpiar texto
-        cleaned_text = re.sub(r'\s+', ' ', text.upper().strip())
+        lines = text.strip().split('\n')
+        cleaned_lines = []
         
-        # Extraer CIC
-        for pattern in self.patterns['cic']:
-            matches = re.findall(pattern, cleaned_text)
-            if matches:
-                # Buscar el CIC más probable (generalmente el más largo o el que sigue el patrón IDMEX)
-                for match in matches:
-                    if len(match) >= 10:  # CIC debe tener al menos 10 dígitos
-                        extracted_data['cic'] = match
-                        break
-                if extracted_data['cic']:
+        for line in lines:
+            # Limpiar cada línea pero mantener estructura
+            cleaned_line = re.sub(r'\s+', '', line.upper().strip())
+            if cleaned_line:
+                cleaned_lines.append(cleaned_line)
+        
+        # Combinar en texto limpio para búsqueda general
+        cleaned_text = ' '.join(cleaned_lines)
+        
+        logger.info(f"Texto limpio para análisis: {cleaned_text}")
+        
+        cic_found = False
+        for line in cleaned_lines:
+            if 'IDMEX' in line:
+                logger.info(f"Línea con IDMEX encontrada: {line}")
+                for pattern in self.patterns['cic']:
+                    matches = re.findall(pattern, line)
+                    if matches:
+                        cic_candidate = matches[0]
+                        if len(cic_candidate) >= 9:
+                            # Tomar solo los primeros 9 dígitos
+                            extracted_data['cic'] = cic_candidate[:9]
+                            logger.info(f"CIC extraído: {extracted_data['cic']} usando patrón: {pattern}")
+                            cic_found = True
+                            break
+                if cic_found:
+                    break
+
+        id_found = False
+        for line in cleaned_lines:
+            if 'IDMEX' in line:
+                logger.info(f"Analizando línea IDMEX para ID Ciudadano: {line}")
+                
+                # Buscar patrón específico: IDMEX[números]<<[números][los últimos 9 dígitos]
+                for pattern in self.patterns['id_ciudadano']:
+                    matches = re.findall(pattern, line)
+                    if matches:
+                        id_candidate = matches[0]
+                        if len(id_candidate) == 9:
+                            extracted_data['id_ciudadano'] = id_candidate
+                            logger.info(f"ID Ciudadano extraído: {extracted_data['id_ciudadano']} usando patrón: {pattern}")
+                            id_found = True
+                            break
+
+                if not id_found:
+                    # Buscar << y tomar los últimos 9 dígitos de la línea
+                    if '<<' in line:
+                        # Dividir por << y tomar la parte después
+                        parts = line.split('<<')
+                        if len(parts) > 1:
+                            after_brackets = parts[-1]  # Última parte después de <<
+                            # Extraer todos los números de esta parte
+                            numbers = re.findall(r'\d+', after_brackets)
+                            if numbers:
+                                # Tomar el último grupo de números y obtener los últimos 9 dígitos
+                                last_numbers = numbers[-1]
+                                if len(last_numbers) >= 9:
+                                    extracted_data['id_ciudadano'] = last_numbers[-9:]
+                                    logger.info(f"ID Ciudadano extraído (fallback): {extracted_data['id_ciudadano']}")
+                                    id_found = True
+                
+                if id_found:
                     break
         
-        # Extraer Identificador del Ciudadano
-        for pattern in self.patterns['id_ciudadano']:
-            matches = re.findall(pattern, cleaned_text)
-            if matches:
-                for match in matches:
-                    # Evitar duplicar el CIC como ID Ciudadano
-                    if match != extracted_data['cic'] and len(match) >= 10:
-                        extracted_data['id_ciudadano'] = match
+        # 🎯 EXTRAER CURP
+        for line in cleaned_lines:
+            for pattern in self.patterns['curp']:
+                matches = re.findall(pattern, line)
+                if matches:
+                    curp_candidate = matches[0]
+                    if len(curp_candidate) == 18:  # CURP debe tener exactamente 18 caracteres
+                        extracted_data['curp'] = curp_candidate
+                        logger.info(f"CURP extraído: {extracted_data['curp']}")
                         break
-                if extracted_data['id_ciudadano']:
-                    break
-        
-        # Extraer CURP
-        for pattern in self.patterns['curp']:
-            matches = re.findall(pattern, cleaned_text)
-            if matches:
-                extracted_data['curp'] = matches[0]
+            if extracted_data['curp']:
                 break
+        
+        if extracted_data['cic'] and len(extracted_data['cic']) != 9:
+            logger.warning(f"CIC tiene longitud incorrecta: {len(extracted_data['cic'])}")
+            extracted_data['cic'] = None
+            
+        if extracted_data['id_ciudadano'] and len(extracted_data['id_ciudadano']) != 9:
+            logger.warning(f"ID Ciudadano tiene longitud incorrecta: {len(extracted_data['id_ciudadano'])}")
+            extracted_data['id_ciudadano'] = None
         
         return extracted_data
     
     def process_ine_image(self, image_file) -> Dict[str, Optional[str]]:
         """Procesa una imagen de INE y extrae los datos principales"""
         try:
-            logger.info("Iniciando procesamiento de imagen INE")
+            logger.info("🔍 Iniciando procesamiento de imagen INE con algoritmos mejorados")
             
             # Leer imagen desde archivo
             image_data = image_file.read()
@@ -227,10 +373,10 @@ class INEProcessor:
             if image is None:
                 raise ValueError("No se pudo decodificar la imagen")
             
-            # Preprocesar imagen
+            # Preprocesar imagen con mejoras
             processed_image = self.preprocess_image(image)
             
-            # Extraer regiones de texto
+            # Extraer regiones de texto optimizadas
             regions = self.extract_text_regions(processed_image)
             
             all_extracted_data = {
@@ -239,60 +385,92 @@ class INEProcessor:
                 'curp': None
             }
             
-            # Procesar cada región
+            # Procesar cada región con prioridad
             for region in regions:
-                logger.info(f"Procesando región: {region['name']}")
+                logger.info(f"🔍 Procesando región: {region['name']}")
                 
-                # Realizar OCR
+                # Realizar OCR mejorado
                 text = self.perform_ocr(region['image'])
                 
                 if text:
-                    logger.info(f"Texto extraído de {region['name']}: {text[:100]}...")
+                    logger.info(f"📝 Texto extraído de {region['name']}: {text[:100]}...")
                     
-                    # Extraer datos con patrones
+                    # Extraer datos con patrones mejorados
                     extracted_data = self.extract_data_with_patterns(text)
                     
                     # Actualizar datos si encontramos algo nuevo
                     for key, value in extracted_data.items():
                         if value and not all_extracted_data[key]:
                             all_extracted_data[key] = value
-                            logger.info(f"Encontrado {key}: {value}")
+                            logger.info(f"✅ Encontrado {key}: {value}")
+                
+                # Si ya tenemos CIC e ID, podemos parar (optimización)
+                if all_extracted_data['cic'] and all_extracted_data['id_ciudadano']:
+                    logger.info("🎯 CIC e ID Ciudadano encontrados, optimizando búsqueda")
+                    break
             
             # Limpieza de memoria
             self.aggressive_memory_cleanup()
             
+            logger.info(f"🏁 Procesamiento completado: CIC={all_extracted_data['cic']}, ID={all_extracted_data['id_ciudadano']}, CURP={all_extracted_data['curp']}")
+            
             return all_extracted_data
             
         except Exception as e:
-            logger.error(f"Error procesando imagen INE: {e}")
+            logger.error(f"❌ Error procesando imagen INE: {e}")
             raise HTTPException(status_code=500, detail=f"Error procesando imagen: {str(e)}")
 
-# Instancia del procesador
+# Instancia del procesador mejorado
 ine_processor = INEProcessor()
 
 @app.get("/")
 async def root():
-    return {"message": "INE OCR Microservice", "status": "active"}
+    return {
+        "message": "INE OCR Microservice - VERSIÓN MEJORADA", 
+        "status": "active",
+        "version": "2.0.0",
+        "improvements": "Patrones CIC/ID optimizados + mejor reconocimiento números"
+    }
 
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy", "service": "ine-ocr"}
+    try:
+        # Verificar que tesseract funcione
+        tesseract_version = pytesseract.get_tesseract_version()
+        
+        return {
+            "status": "healthy", 
+            "service": "ine-ocr",
+            "version": "2.0.0",
+            "tesseract_version": str(tesseract_version),
+            "improvements": [
+                "Patrones CIC/ID optimizados para formato real INE",
+                "Reconocimiento mejorado de números 1/7",
+                "Preprocesamiento avanzado de imagen",
+                "Configuraciones OCR específicas para números"
+            ]
+        }
+    except Exception as e:
+        logger.error(f"Health check failed: {e}")
+        return {
+            "status": "unhealthy",
+            "service": "ine-ocr", 
+            "error": str(e)
+        }
 
 @app.post("/extract-ine-data")
 async def extract_ine_data(
     ine_front: UploadFile = File(..., description="Imagen frontal de la INE"),
     ine_back: UploadFile = File(None, description="Imagen trasera de la INE (opcional)")
 ):
-    """
-    Extrae CIC, Identificador del Ciudadano y CURP de las imágenes de INE
-    """
+   
     try:
         # Validar archivo frontal
         if not ine_front.content_type.startswith('image/'):
             raise HTTPException(status_code=400, detail="El archivo frontal debe ser una imagen")
         
         # Procesar imagen frontal
-        logger.info("Procesando imagen frontal de INE")
+        logger.info("🔍 Procesando imagen frontal de INE con algoritmos mejorados")
         front_data = ine_processor.process_ine_image(ine_front.file)
         
         result = {
@@ -302,12 +480,13 @@ async def extract_ine_data(
                 "id_ciudadano": front_data.get('id_ciudadano'),
                 "curp": front_data.get('curp')
             },
-            "processed_images": ["front"]
+            "processed_images": ["front"],
+            "version": "2.0.0"
         }
         
         # Si se proporcionó imagen trasera, procesarla también
         if ine_back and ine_back.content_type.startswith('image/'):
-            logger.info("Procesando imagen trasera de INE")
+            logger.info("🔍 Procesando imagen trasera de INE con algoritmos mejorados")
             back_data = ine_processor.process_ine_image(ine_back.file)
             
             # Combinar datos (priorizar datos del frente, complementar con trasera)
@@ -323,7 +502,9 @@ async def extract_ine_data(
                 "success": False,
                 "error": "No se pudieron extraer los datos mínimos (CIC o ID Ciudadano)",
                 "data": result["data"],
-                "suggestion": "Verifica que la imagen sea clara y esté bien iluminada"
+                "suggestion": "Verifica que la imagen sea clara, esté bien iluminada y contenga la línea IDMEX",
+                "expected_format": "IDMEX2559201236<<0835123456789 (CIC: primeros 9 después de IDMEX, ID: últimos 9)",
+                "version": "2.0.0"
             }
         
         logger.info(f"Extracción exitosa: CIC={result['data']['cic']}, ID={result['data']['id_ciudadano']}")
@@ -339,6 +520,7 @@ async def extract_ine_data(
 async def extract_ine_data_base64(request_data: dict):
     """
     Extrae datos de INE usando imágenes en formato base64
+    VERSIÓN MEJORADA con patrones optimizados
     """
     try:
         front_b64 = request_data.get('ine_front_b64')
@@ -362,7 +544,8 @@ async def extract_ine_data_base64(request_data: dict):
                 "id_ciudadano": front_result.get('id_ciudadano'),
                 "curp": front_result.get('curp')
             },
-            "processed_images": ["front"]
+            "processed_images": ["front"],
+            "version": "2.0.0"
         }
         
         # Procesar imagen trasera si está disponible
@@ -390,14 +573,9 @@ async def extract_ine_data_base64(request_data: dict):
         raise HTTPException(status_code=500, detail=f"Error interno: {str(e)}")
 
 if __name__ == "__main__":
-    import uvicorn
-    import os
-    
-    # Railway proporciona PORT como variable de entorno
+
     port = int(os.environ.get("PORT", 8000))
-    
-    print(f"🚀 Starting INE OCR service on port {port}")
-    print(f"🏥 Health check available at: http://0.0.0.0:{port}/health")
+
     
     uvicorn.run(
         app, 
